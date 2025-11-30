@@ -1,7 +1,7 @@
 """
 Servidor FastAPI para receber mensagens do WhatsApp e processar com o agente
-Suporta: Texto, Áudio (Transcrição), Imagem (Visão) e PDF (Extração de Texto + Link)
-Versão: 1.5.5 (Correção de LID e Buffer Personalizado)
+Suporta: Texto, Áudio (Transcrição Whisper Local), Imagem (Visão) e PDF (Extração de Texto + Link)
+Versão: 1.6.0 (Upgrade: Transcrição Inteligente com Contexto)
 """
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -14,6 +14,8 @@ import random
 import threading
 import re
 import io
+import os  # Novo import
+from openai import OpenAI  # Novo import para usar o Whisper direto
 
 # Tenta importar pypdf para leitura de comprovantes
 try:
@@ -34,7 +36,7 @@ from tools.redis_tools import (
 
 logger = setup_logger(__name__)
 
-app = FastAPI(title="Agente de Supermercado", version="1.5.5")
+app = FastAPI(title="Agente de Supermercado", version="1.6.0")
 
 # --- Models ---
 class WhatsAppMessage(BaseModel):
@@ -58,7 +60,7 @@ def get_api_base_url() -> str:
     return (settings.uaz_api_url or settings.whatsapp_api_url or "").strip().rstrip("/")
 
 def get_media_url_uaz(message_id: str) -> Optional[str]:
-    """Solicita link público da mídia (Imagem/PDF)."""
+    """Solicita link público da mídia (Imagem/PDF/Áudio)."""
     if not message_id: return None
     base = get_api_base_url()
     if not base: return None
@@ -117,35 +119,66 @@ def process_pdf_uaz(message_id: str) -> Optional[str]:
         logger.error(f"Erro ao ler PDF: {e}")
         return None
 
+# --- NOVA FUNÇÃO DE TRANSCRIÇÃO INTELIGENTE ---
 def transcribe_audio_uaz(message_id: str) -> Optional[str]:
-    """Solicita transcrição de áudio."""
+    """
+    Baixa o áudio e transcreve usando OpenAI Whisper com contexto de supermercado.
+    Substitui a transcrição nativa da API externa para garantir melhor precisão.
+    """
     if not message_id: return None
-    base = get_api_base_url()
-    if not base: return None
-
-    try:
-        from urllib.parse import urlparse
-        parsed = urlparse(base)
-        url = f"{parsed.scheme}://{parsed.netloc}/message/download"
-    except:
-        url = f"{base.split('/message')[0]}/message/download"
-
-    headers = {"Content-Type": "application/json", "token": (settings.whatsapp_token or "").strip()}
-    payload = {
-        "id": message_id, 
-        "transcribe": True, 
-        "return_link": False, 
-        "openai_apikey": settings.openai_api_key
-    }
     
+    # 1. Obter a URL do áudio (usa a função existente no mesmo arquivo)
+    url = get_media_url_uaz(message_id)
+    if not url: return None
+
+    temp_filename = f"temp_{message_id}.ogg"
+
     try:
-        logger.info(f"🎧 Transcrevendo áudio: {message_id}")
-        resp = requests.post(url, headers=headers, json=payload, timeout=25)
-        if resp.status_code == 200:
-            return resp.json().get("transcription")
+        logger.info(f"🎧 Baixando áudio para transcrição inteligente: {message_id}")
+        
+        # 2. Baixar o arquivo de áudio
+        # Se sua API UAZ requer token para download, passamos no header.
+        headers = {} 
+        if settings.whatsapp_token:
+             headers["token"] = (settings.whatsapp_token or "").strip()
+             
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        
+        # 3. Salvar temporariamente
+        with open(temp_filename, "wb") as f:
+            f.write(response.content)
+
+        # 4. Transcrever com a OpenAI (Whisper)
+        # Instancia o cliente usando a chave configurada no settings
+        client = OpenAI(api_key=settings.openai_api_key)
+        
+        with open(temp_filename, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1", 
+                file=audio_file,
+                language="pt",
+                # Contexto para melhorar reconhecimento de marcas e termos específicos
+                prompt="Lista de compras, supermercado, marcas: Ypê, Coca-Cola, Skol, Brahma, Heineken, Omo, Tixan, Arroz Camil, Feijão Kicaldo, Ninho, Aptamil, Piracanjuba, Mussarela, Calabresa."
+            )
+        
+        # 5. Limpar e retornar
+        texto = transcript.text
+        logger.info(f"📝 Transcrição Whisper: {texto}")
+        
+        # Remover arquivo temporário
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
+            
+        return texto
+
     except Exception as e:
-        logger.error(f"Erro transcrição: {e}")
-    return None
+        logger.error(f"❌ Erro na transcrição OpenAI: {e}")
+        # Tenta limpar o arquivo se der erro
+        if os.path.exists(temp_filename):
+            try: os.remove(temp_filename)
+            except: pass
+        return None
 
 def _extract_incoming(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -263,6 +296,7 @@ def _extract_incoming(payload: Dict[str, Any]) -> Dict[str, Any]:
     # --- Lógica de Mídia ---
     if message_type == "audio" and not mensagem_texto:
         if message_id:
+            # Chama a nova função de transcrição inteligente
             trans = transcribe_audio_uaz(message_id)
             mensagem_texto = f"[Áudio]: {trans}" if trans else "[Áudio inaudível]"
         else:
@@ -417,7 +451,7 @@ def buffer_loop(tel):
 
 # --- Endpoints ---
 @app.get("/")
-async def root(): return {"status":"online", "ver":"1.5.5"}
+async def root(): return {"status":"online", "ver":"1.6.0"}
 
 @app.get("/health")
 async def health(): return {"status":"healthy", "ts":datetime.now().isoformat()}
