@@ -1,6 +1,6 @@
 """
 Agente de IA para Atendimento de Supermercado usando LangGraph
-Versão com suporte a VISÃO, Pedidos com Comprovante e Regras de Edição (10min)
+Versão: RAG Dinâmico (Regras via Banco Vetorial)
 """
 
 from typing import Dict, Any, TypedDict, Sequence, List
@@ -19,10 +19,10 @@ import os
 
 from config.settings import settings
 from config.logger import setup_logger
-from tools.http_tools import estoque, pedidos, alterar, ean_lookup, estoque_preco
+# Importamos a nova search_rules aqui
+from tools.http_tools import estoque, pedidos, alterar, ean_lookup, estoque_preco, search_rules
 from tools.time_tool import get_current_time, search_message_history
 from memory.limited_postgres_memory import LimitedPostgresChatMessageHistory
-# NOVOS IMPORTS PARA REGRAS DE EDIÇÃO
 from tools.redis_tools import set_order_edit_window, is_order_editable
 
 logger = setup_logger(__name__)
@@ -33,76 +33,56 @@ logger = setup_logger(__name__)
 
 @tool
 def estoque_tool(url: str) -> str:
-    """
-    Consultar estoque e preço atual dos produtos no sistema do supermercado.
-    Ex: 'https://.../api/produtos/consulta?nome=arroz'
-    """
+    """Consultar estoque e preço atual."""
     return estoque(url)
 
 @tool
 def pedidos_tool(json_body: str) -> str:
-    """
-    Enviar o pedido finalizado para o painel dos funcionários.
-    Automaticamente abre uma janela de 10 minutos para alterações.
-    """
-    # Executa o envio original
+    """Enviar o pedido finalizado. Abre janela de edição de 10min."""
     resultado = pedidos(json_body)
-    
-    # Se deu certo, ativa o timer no Redis para permitir edição por 10min
     if "sucesso" in resultado.lower() or "✅" in resultado:
         try:
             data = json.loads(json_body)
-            # Tenta pegar telefone do payload
             tel = data.get("telefone") or data.get("cliente_telefone")
             if tel:
                 set_order_edit_window(tel, minutes=10)
-                logger.info(f"⏳ Janela de edição de 10min aberta para {tel}")
-        except Exception as e:
-            logger.error(f"Erro ao definir janela de edição: {e}")
-            
+        except: pass
     return resultado
 
 @tool
 def alterar_tool(telefone: str, json_body: str) -> str:
-    """Atualizar o pedido no painel (apenas se estiver dentro da janela permitida)."""
+    """Atualizar pedido (apenas se permitido)."""
     return alterar(telefone, json_body)
 
 @tool
 def check_edit_window_tool(telefone: str) -> str:
-    """
-    Verifica se o pedido anterior ainda pode ser alterado.
-    Retorna: 'PERMITIDO' ou 'EXPIRADO'.
-    Use esta ferramenta OBRIGATORIAMENTE quando o cliente quiser adicionar/trocar itens após fechar o pedido.
-    """
-    pode_editar = is_order_editable(telefone)
-    if pode_editar:
-        return "PERMITIDO: O pedido foi fechado há menos de 10 minutos. Use 'alterar_tool'."
-    else:
-        return "EXPIRADO: O tempo de edição acabou (pedido já seguiu). Crie um NOVO PEDIDO com 'pedidos_tool'."
+    """Verifica se pedido ainda pode ser alterado."""
+    if is_order_editable(telefone):
+        return "PERMITIDO: Pedido fechado há menos de 10 min."
+    return "EXPIRADO: Tempo acabou. Crie NOVO PEDIDO."
 
 @tool
 def search_history_tool(telefone: str, keyword: str = None) -> str:
-    """Busca mensagens anteriores do cliente com horários."""
+    """Busca mensagens anteriores."""
     return search_message_history(telefone, keyword)
 
 @tool
 def time_tool() -> str:
-    """Retorna a data e hora atual."""
+    """Data e hora atual."""
     return get_current_time()
 
 @tool("ean")
 def ean_tool_alias(query: str) -> str:
-    """Buscar EAN/infos do produto na base de conhecimento."""
+    """Buscar produto na base."""
     q = (query or "").strip()
     if q.startswith("{") and q.endswith("}"): q = ""
     return ean_lookup(q)
 
 @tool("estoque")
 def estoque_preco_alias(ean: str) -> str:
-    """Consulta preço e disponibilidade pelo EAN (apenas dígitos)."""
+    """Consulta preço pelo EAN."""
     return estoque_preco(ean)
 
-# Ferramentas ativas (Incluindo a nova check_edit_window_tool)
 ACTIVE_TOOLS = [
     ean_tool_alias,
     estoque_preco_alias,
@@ -111,24 +91,26 @@ ACTIVE_TOOLS = [
     search_history_tool,
     pedidos_tool,
     alterar_tool,
-    check_edit_window_tool, # <--- ADICIONADA
+    check_edit_window_tool,
 ]
 
 # ============================================
-# Funções do Grafo
+# Configuração do Grafo e Prompt
 # ============================================
 
 def load_system_prompt() -> str:
     base_dir = Path(__file__).resolve().parent
-    prompt_path = str((base_dir / "prompts" / "agent_system.md"))
+    # MUDANÇA: Carrega o prompt minimalista
+    prompt_path = str((base_dir / "prompts" / "agent_system_minimal.md"))
     try:
         text = Path(prompt_path).read_text(encoding="utf-8")
+        # Mantemos os replaces caso você use no futuro, mas o minimal talvez não precise
         text = text.replace("{base_url}", settings.supermercado_base_url)
-        text = text.replace("{ean_base}", settings.estoque_ean_base_url)
         return text
     except Exception as e:
-        logger.error(f"Falha ao carregar prompt: {e}")
-        raise
+        logger.error(f"Falha ao carregar prompt minimalista: {e}")
+        # Fallback simples caso arquivo não exista
+        return "Você é um assistente de supermercado. Siga as regras injetadas no contexto."
 
 def _build_llm():
     model = getattr(settings, "llm_model", "gpt-4o-mini")
@@ -139,6 +121,7 @@ def create_agent_with_history():
     system_prompt = load_system_prompt()
     llm = _build_llm()
     memory = MemorySaver()
+    # O prompt base é o minimalista
     agent = create_react_agent(llm, ACTIVE_TOOLS, prompt=system_prompt, checkpointer=memory)
     return agent
 
@@ -150,83 +133,82 @@ def get_agent_graph():
     return _agent_graph
 
 # ============================================
-# Função Principal
+# Função Principal (Com Injeção Vetorial)
 # ============================================
 
 def run_agent_langgraph(telefone: str, mensagem: str) -> Dict[str, Any]:
-    """
-    Executa o agente. Suporta texto e imagem (via tag [MEDIA_URL: ...]).
-    """
     print(f"[AGENT] Telefone: {telefone} | Msg bruta: {mensagem[:50]}...")
     
-    # 1. Extrair URL de imagem se houver (Formato: [MEDIA_URL: https://...])
     image_url = None
     clean_message = mensagem
     
-    # Regex para encontrar a tag de mídia injetada pelo server.py
     media_match = re.search(r"\[MEDIA_URL:\s*(.*?)\]", mensagem)
     if media_match:
         image_url = media_match.group(1)
-        # Remove a tag da mensagem de texto para não confundir o histórico visual
-        # Mas mantemos o texto descritivo original
-        clean_message = mensagem.replace(media_match.group(0), "").strip()
-        if not clean_message:
-            clean_message = "Analise esta imagem/comprovante enviada."
-        logger.info(f"📸 Mídia detectada para visão: {image_url}")
+        clean_message = mensagem.replace(media_match.group(0), "").strip() or "Analise esta imagem."
 
-    # 2. Salvar histórico (User)
-    history_handler = None
+    # Salvar User no DB
     try:
-        history_handler = get_session_history(telefone)
-        history_handler.add_user_message(mensagem)
-    except Exception as e:
-        logger.error(f"Erro DB User: {e}")
+        hist = get_session_history(telefone)
+        hist.add_user_message(mensagem)
+    except: pass
 
     try:
+        # --- LÓGICA RAG: BUSCA REGRAS AUTOMATICAMENTE ---
+        logger.info(f"🔍 Buscando regras para: '{clean_message[:30]}...'")
+        regras_encontradas = search_rules(clean_message)
+        
+        system_injection = ""
+        if regras_encontradas:
+            logger.info("✅ Regras encontradas e injetadas no contexto.")
+            system_injection = f"""
+🚨 [REGRAS DE OURO - SIGA ESTRITAMENTE]
+O sistema encontrou estas regras no manual da empresa para o contexto atual:
+
+{regras_encontradas}
+
+APLIQUE ESSAS REGRAS NA SUA RESPOSTA IMEDIATAMENTE.
+"""
+        else:
+            system_injection = "" # Nenhuma regra específica, segue o padrão
+        
+        # ------------------------------------------------
+        
         agent = get_agent_graph()
         
-        # 3. Construir mensagem (Texto Simples ou Multimodal)
+        messages_payload = []
+        
+        # 1. Injeta a Regra como SystemMessage (Alta prioridade)
+        if system_injection:
+            messages_payload.append(SystemMessage(content=system_injection))
+        
+        # 2. Adiciona a mensagem do usuário
         if image_url:
-            # Formato multimodal para GPT-4o / GPT-4o-mini
-            message_content = [
+            messages_payload.append(HumanMessage(content=[
                 {"type": "text", "text": clean_message},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": image_url}
-                }
-            ]
-            initial_message = HumanMessage(content=message_content)
+                {"type": "image_url", "image_url": {"url": image_url}}
+            ]))
         else:
-            initial_message = HumanMessage(content=clean_message)
+            messages_payload.append(HumanMessage(content=clean_message))
 
-        initial_state = {"messages": [initial_message]}
+        initial_state = {"messages": messages_payload}
         config = {"configurable": {"thread_id": telefone}}
         
-        logger.info("Executando agente...")
         result = agent.invoke(initial_state, config)
         
-        # 4. Extrair resposta
-        output = "Desculpe, não entendi."
+        output = "Desculpe, erro técnico."
         if isinstance(result, dict) and "messages" in result:
-            messages = result["messages"]
-            if messages:
-                last = messages[-1]
-                output = last.content if isinstance(last.content, str) else str(last.content)
+            output = str(result["messages"][-1].content)
         
-        logger.info("✅ Agente executado")
-        
-        # 5. Salvar histórico (IA)
-        if history_handler:
-            try:
-                history_handler.add_ai_message(output)
-            except Exception as e:
-                logger.error(f"Erro DB AI: {e}")
+        # Salvar AI no DB
+        try: hist.add_ai_message(output)
+        except: pass
 
         return {"output": output, "error": None}
         
     except Exception as e:
         logger.error(f"Falha agente: {e}", exc_info=True)
-        return {"output": "Tive um problema técnico, tente novamente.", "error": str(e)}
+        return {"output": "Erro no sistema.", "error": str(e)}
 
 def get_session_history(session_id: str) -> LimitedPostgresChatMessageHistory:
     return LimitedPostgresChatMessageHistory(
