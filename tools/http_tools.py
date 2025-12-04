@@ -21,15 +21,11 @@ def get_auth_headers() -> Dict[str, str]:
 
 def estoque(url: str) -> str:
     """Consulta o estoque e preço de produtos no sistema do supermercado."""
-    
-    # --- CORREÇÃO: Tratamento de URL relativa ---
-    # Se o agente enviar apenas "/produtos/..." ou "api/...", adicionamos a base.
+    # Tratamento de URL relativa
     if not url.startswith("http"):
-        # Garante que usamos a URL base configurada se o LLM esquecer o domínio
         base = (settings.supermercado_base_url or "").rstrip("/")
         path = url.lstrip("/")
         url = f"{base}/{path}"
-    # --------------------------------------------
 
     logger.info(f"Consultando estoque: {url}")
     try:
@@ -46,12 +42,25 @@ def pedidos(json_body: str) -> str:
     """Envia um pedido finalizado para o painel."""
     url = f"{settings.supermercado_base_url}/pedidos/"
     logger.info(f"Enviando pedido para: {url}")
+    
     try:
         data = json.loads(json_body)
-        response = requests.post(url, headers=get_auth_headers(), json=data, timeout=10)
+        response = requests.post(url, headers=get_auth_headers(), json=data, timeout=15)
+        
+        # --- MELHORIA: Tratamento de Erro de Validação (422) ---
+        if response.status_code in [400, 422]:
+            error_msg = response.text
+            logger.error(f"❌ API recusou o pedido ({response.status_code}): {error_msg}")
+            # Retorna o erro detalhado para o Agente entender o que faltou
+            return f"ERRO API ({response.status_code}): O formato do pedido está incorreto. Detalhes: {error_msg}. Corrija o JSON e tente novamente."
+        # -------------------------------------------------------
+
         response.raise_for_status()
         result = response.json()
         return f"✅ Pedido enviado com sucesso!\n\nResposta: {json.dumps(result, indent=2, ensure_ascii=False)}"
+    
+    except json.JSONDecodeError:
+        return "Erro: O conteúdo enviado não é um JSON válido."
     except Exception as e:
         logger.error(f"Erro pedidos: {e}")
         return f"Erro ao enviar pedido: {e}"
@@ -65,6 +74,11 @@ def alterar(telefone: str, json_body: str) -> str:
     try:
         data = json.loads(json_body)
         response = requests.put(url, headers=get_auth_headers(), json=data, timeout=10)
+        
+        # Tratamento de erro 422 também na alteração
+        if response.status_code in [400, 422]:
+             return f"ERRO AO ALTERAR ({response.status_code}): {response.text}"
+
         response.raise_for_status()
         result = response.json()
         return f"✅ Pedido atualizado!\n\nResposta: {json.dumps(result, indent=2, ensure_ascii=False)}"
@@ -74,7 +88,7 @@ def alterar(telefone: str, json_body: str) -> str:
 
 
 def ean_lookup(query: str) -> str:
-    """Busca informações/EAN do produto via Supabase (Type=documents)."""
+    """Busca informações/EAN do produto via Supabase."""
     url = (settings.smart_responder_url or "").strip().replace("`", "")
     auth_token = (settings.smart_responder_auth or settings.smart_responder_token or "").strip()
     
@@ -86,12 +100,10 @@ def ean_lookup(query: str) -> str:
         "Content-Type": "application/json"
     }
     
-    # Mantém o padrão antigo (busca de produtos) se não especificar type
     payload = {"query": query}
     
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
-        # Retorna o texto bruto para ser processado pelo agente
         return resp.text 
     except Exception as e:
         return f"Erro na busca EAN: {e}"
@@ -114,15 +126,11 @@ def estoque_preco(ean: str) -> str:
 
 
 def search_rules(query: str) -> str:
-    """
-    Busca regras no Supabase (type='rules') para injetar no contexto.
-    Retorna apenas o texto das regras encontradas.
-    """
+    """Busca regras no Supabase (type='rules')."""
     url = (settings.smart_responder_url or "").strip()
     auth_token = (settings.smart_responder_auth or settings.smart_responder_token or "").strip()
     
     if not url or not auth_token:
-        # Falha silenciosa para não quebrar o fluxo se não configurado
         return ""
 
     headers = {
@@ -130,32 +138,26 @@ def search_rules(query: str) -> str:
         "Content-Type": "application/json"
     }
     
-    # Payload específico para buscar na tabela de regras
     payload = {
         "query": query,
-        "type": "rules",  # <--- Ativa a busca na tabela agent_rules
-        "match_count": 3  # Traz apenas as 3 regras mais relevantes
+        "type": "rules",
+        "match_count": 3
     }
     
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=5)
-        
         if response.status_code != 200:
             return ""
 
         data = response.json()
-        
         if isinstance(data, list) and data:
             regras_texto = ""
             for item in data:
-                # O Supabase retorna 'content' e talvez 'category'
                 conteudo = item.get('content', '')
                 if conteudo:
                     regras_texto += f"- {conteudo}\n"
             return regras_texto
-            
-        return "" # Nenhuma regra encontrada
-
+        return ""
     except Exception as e:
         logger.error(f"Erro ao buscar regras automáticas: {e}")
         return ""
