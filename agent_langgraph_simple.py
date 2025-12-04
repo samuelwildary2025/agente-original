@@ -1,10 +1,17 @@
 """
 Agente de IA para Atendimento de Supermercado usando LangGraph
-Versão: RAG Dinâmico (Regras via Banco Vetorial)
+Versão: RAG Dinâmico + Contagem de Tokens (Telemetria)
 """
 
 from typing import Dict, Any, TypedDict, Sequence, List
 import re
+import json
+import os
+from pathlib import Path
+
+# Lib para contar tokens (Igual OpenAI)
+import tiktoken 
+
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
 from langchain_core.tools import tool
@@ -13,19 +20,31 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode, tools_condition, create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
-from pathlib import Path
-import json
-import os
 
 from config.settings import settings
 from config.logger import setup_logger
-# Importamos a nova search_rules aqui
 from tools.http_tools import estoque, pedidos, alterar, ean_lookup, estoque_preco, search_rules
 from tools.time_tool import get_current_time, search_message_history
 from memory.limited_postgres_memory import LimitedPostgresChatMessageHistory
 from tools.redis_tools import set_order_edit_window, is_order_editable
 
 logger = setup_logger(__name__)
+
+# ============================================
+# Função Auxiliar: Contar Tokens
+# ============================================
+def count_tokens(text: str, model: str = "gpt-4o") -> int:
+    """Conta quantos tokens um texto gastaria no modelo especificado."""
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+        return len(encoding.encode(text))
+    except KeyError:
+        # Fallback para encoding padrão se modelo for muito novo/desconhecido
+        encoding = tiktoken.get_encoding("cl100k_base")
+        return len(encoding.encode(text))
+    except Exception as e:
+        logger.warning(f"Erro ao contar tokens: {e}")
+        return 0
 
 # ============================================
 # Definição das Ferramentas (Tools)
@@ -100,16 +119,13 @@ ACTIVE_TOOLS = [
 
 def load_system_prompt() -> str:
     base_dir = Path(__file__).resolve().parent
-    # MUDANÇA: Carrega o prompt minimalista
     prompt_path = str((base_dir / "prompts" / "agent_system_minimal.md"))
     try:
         text = Path(prompt_path).read_text(encoding="utf-8")
-        # Mantemos os replaces caso você use no futuro, mas o minimal talvez não precise
         text = text.replace("{base_url}", settings.supermercado_base_url)
         return text
     except Exception as e:
         logger.error(f"Falha ao carregar prompt minimalista: {e}")
-        # Fallback simples caso arquivo não exista
         return "Você é um assistente de supermercado. Siga as regras injetadas no contexto."
 
 def _build_llm():
@@ -121,7 +137,6 @@ def create_agent_with_history():
     system_prompt = load_system_prompt()
     llm = _build_llm()
     memory = MemorySaver()
-    # O prompt base é o minimalista
     agent = create_react_agent(llm, ACTIVE_TOOLS, prompt=system_prompt, checkpointer=memory)
     return agent
 
@@ -133,7 +148,7 @@ def get_agent_graph():
     return _agent_graph
 
 # ============================================
-# Função Principal (Com Injeção Vetorial)
+# Função Principal (Com Logs e Contagem de Tokens)
 # ============================================
 
 def run_agent_langgraph(telefone: str, mensagem: str) -> Dict[str, Any]:
@@ -147,20 +162,30 @@ def run_agent_langgraph(telefone: str, mensagem: str) -> Dict[str, Any]:
         image_url = media_match.group(1)
         clean_message = mensagem.replace(media_match.group(0), "").strip() or "Analise esta imagem."
 
-    # Salvar User no DB
     try:
         hist = get_session_history(telefone)
         hist.add_user_message(mensagem)
     except: pass
 
     try:
-        # --- LÓGICA RAG: BUSCA REGRAS AUTOMATICAMENTE ---
+        # 1. Carrega o Prompt Base (Minimalista)
+        base_system_prompt = load_system_prompt()
+        
+        # 2. Busca Regras (RAG)
         logger.info(f"🔍 Buscando regras para: '{clean_message[:30]}...'")
         regras_encontradas = search_rules(clean_message)
         
+        # 3. Calcula Tokens do RAG
+        tokens_rag = count_tokens(regras_encontradas) if regras_encontradas else 0
+        
+        # LOG DETALHADO DO RAG
+        if regras_encontradas:
+            logger.info(f"📜 [RAG] Supabase Retornou ({tokens_rag} tokens):\n{regras_encontradas.strip()}")
+        else:
+            logger.info("🚫 [RAG] Supabase Retornou: Nenhuma regra (0 tokens)")
+            
         system_injection = ""
         if regras_encontradas:
-            logger.info("✅ Regras encontradas e injetadas no contexto.")
             system_injection = f"""
 🚨 [REGRAS DE OURO - SIGA ESTRITAMENTE]
 O sistema encontrou estas regras no manual da empresa para o contexto atual:
@@ -169,20 +194,16 @@ O sistema encontrou estas regras no manual da empresa para o contexto atual:
 
 APLIQUE ESSAS REGRAS NA SUA RESPOSTA IMEDIATAMENTE.
 """
-        else:
-            system_injection = "" # Nenhuma regra específica, segue o padrão
         
-        # ------------------------------------------------
-        
+        # 4. Prepara Mensagens para o Agente
         agent = get_agent_graph()
-        
         messages_payload = []
         
-        # 1. Injeta a Regra como SystemMessage (Alta prioridade)
+        # Injeta Regras
         if system_injection:
             messages_payload.append(SystemMessage(content=system_injection))
         
-        # 2. Adiciona a mensagem do usuário
+        # Adiciona User Message
         if image_url:
             messages_payload.append(HumanMessage(content=[
                 {"type": "text", "text": clean_message},
@@ -191,6 +212,14 @@ APLIQUE ESSAS REGRAS NA SUA RESPOSTA IMEDIATAMENTE.
         else:
             messages_payload.append(HumanMessage(content=clean_message))
 
+        # 5. CÁLCULO TOTAL DE TOKENS (Estimativa de Entrada)
+        # Somamos: Prompt Base + Injeção RAG + Mensagem do Usuário
+        full_context_str = base_system_prompt + "\n" + system_injection + "\n" + clean_message
+        total_input_tokens = count_tokens(full_context_str)
+        
+        logger.info(f"📊 [MÉTRICAS] Tokens RAG: {tokens_rag} | Tokens TOTAL Entrada: ~{total_input_tokens}")
+
+        # 6. Execução do Agente
         initial_state = {"messages": messages_payload}
         config = {"configurable": {"thread_id": telefone}}
         
@@ -199,8 +228,11 @@ APLIQUE ESSAS REGRAS NA SUA RESPOSTA IMEDIATAMENTE.
         output = "Desculpe, erro técnico."
         if isinstance(result, dict) and "messages" in result:
             output = str(result["messages"][-1].content)
+            
+            # Opcional: Contar tokens da saída também
+            tokens_output = count_tokens(output)
+            logger.info(f"📊 [MÉTRICAS] Tokens Saída (Resposta): {tokens_output}")
         
-        # Salvar AI no DB
         try: hist.add_ai_message(output)
         except: pass
 
