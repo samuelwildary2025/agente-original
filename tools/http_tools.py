@@ -21,7 +21,6 @@ def get_auth_headers() -> Dict[str, str]:
 
 def estoque(url: str) -> str:
     """Consulta o estoque e preço de produtos no sistema do supermercado."""
-    # Tratamento de URL relativa
     if not url.startswith("http"):
         base = (settings.supermercado_base_url or "").rstrip("/")
         path = url.lstrip("/")
@@ -47,13 +46,10 @@ def pedidos(json_body: str) -> str:
         data = json.loads(json_body)
         response = requests.post(url, headers=get_auth_headers(), json=data, timeout=15)
         
-        # --- MELHORIA: Tratamento de Erro de Validação (422) ---
         if response.status_code in [400, 422]:
             error_msg = response.text
             logger.error(f"❌ API recusou o pedido ({response.status_code}): {error_msg}")
-            # Retorna o erro detalhado para o Agente entender o que faltou
             return f"ERRO API ({response.status_code}): O formato do pedido está incorreto. Detalhes: {error_msg}. Corrija o JSON e tente novamente."
-        # -------------------------------------------------------
 
         response.raise_for_status()
         result = response.json()
@@ -75,7 +71,6 @@ def alterar(telefone: str, json_body: str) -> str:
         data = json.loads(json_body)
         response = requests.put(url, headers=get_auth_headers(), json=data, timeout=10)
         
-        # Tratamento de erro 422 também na alteração
         if response.status_code in [400, 422]:
              return f"ERRO AO ALTERAR ({response.status_code}): {response.text}"
 
@@ -100,7 +95,12 @@ def ean_lookup(query: str) -> str:
         "Content-Type": "application/json"
     }
     
-    payload = {"query": query}
+    # --- AJUSTE 1: PRODUTOS (Queremos variedade) ---
+    payload = {
+        "query": query,
+        "match_count": 3  # Traz até 3 produtos similares
+    }
+    # -----------------------------------------------
     
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
@@ -138,11 +138,13 @@ def search_rules(query: str) -> str:
         "Content-Type": "application/json"
     }
     
+    # --- AJUSTE 2: REGRAS (Queremos precisão) ---
     payload = {
         "query": query,
         "type": "rules",
-        "match_count": 3
+        "match_count": 1  # Traz APENAS a regra mais relevante
     }
+    # --------------------------------------------
     
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=5)
