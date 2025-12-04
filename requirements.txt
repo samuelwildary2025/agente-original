@@ -8,7 +8,11 @@ openai==1.54.4
 langchain-anthropic==0.3.11
 anthropic>=0.28.0
 
-# Fix compatibilidade: httpx 0.28 removeu 'proxies'; manter <0.28
+# Token Counting (Telemetria)
+tiktoken>=0.7.0
+
+# Fix compatibilidade: httpx 0.28 removeu 'proxies';
+# manter <0.28
 httpx<0.28,>=0.23.0
 
 # Web Framework
