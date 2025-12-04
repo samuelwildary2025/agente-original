@@ -40,12 +40,16 @@ def count_tokens(text: str, model: str = "gpt-4o") -> int:
         logger.warning(f"Erro ao contar tokens: {e}")
         return 0
 
+# --- FERRAMENTAS (Com Docstrings Obrigatórias) ---
+
 @tool
 def estoque_tool(url: str) -> str:
+    """Consultar estoque e preço atual."""
     return estoque(url)
 
 @tool
 def pedidos_tool(json_body: str) -> str:
+    """Enviar o pedido finalizado. Abre janela de edição de 10min."""
     resultado = pedidos(json_body)
     if "sucesso" in resultado.lower() or "✅" in resultado:
         try:
@@ -58,30 +62,36 @@ def pedidos_tool(json_body: str) -> str:
 
 @tool
 def alterar_tool(telefone: str, json_body: str) -> str:
+    """Atualizar pedido (apenas se permitido)."""
     return alterar(telefone, json_body)
 
 @tool
 def check_edit_window_tool(telefone: str) -> str:
+    """Verifica se pedido ainda pode ser alterado."""
     if is_order_editable(telefone):
         return "PERMITIDO: Pedido fechado há menos de 10 min."
     return "EXPIRADO: Tempo acabou. Crie NOVO PEDIDO."
 
 @tool
 def search_history_tool(telefone: str, keyword: str = None) -> str:
+    """Busca mensagens anteriores."""
     return search_message_history(telefone, keyword)
 
 @tool
 def time_tool() -> str:
+    """Data e hora atual."""
     return get_current_time()
 
 @tool("ean")
 def ean_tool_alias(query: str) -> str:
+    """Buscar produto na base."""
     q = (query or "").strip()
     if q.startswith("{") and q.endswith("}"): q = ""
     return ean_lookup(q)
 
 @tool("estoque")
 def estoque_preco_alias(ean: str) -> str:
+    """Consulta preço pelo EAN."""
     return estoque_preco(ean)
 
 ACTIVE_TOOLS = [
@@ -94,6 +104,8 @@ ACTIVE_TOOLS = [
     alterar_tool,
     check_edit_window_tool,
 ]
+
+# --- LÓGICA DO AGENTE ---
 
 def load_system_prompt() -> str:
     base_dir = Path(__file__).resolve().parent
