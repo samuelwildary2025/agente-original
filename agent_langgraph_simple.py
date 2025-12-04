@@ -1,6 +1,6 @@
 """
 Agente de IA para Atendimento de Supermercado usando LangGraph
-Versão: RAG Dinâmico + Contagem de Tokens (Telemetria)
+Versão: RAG Dinâmico + Contagem de Tokens + Injeção de Telefone
 """
 
 from typing import Dict, Any, TypedDict, Sequence, List
@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 
-# Lib para contar tokens (Igual OpenAI)
 import tiktoken 
 
 from langchain_openai import ChatOpenAI
@@ -30,34 +29,23 @@ from tools.redis_tools import set_order_edit_window, is_order_editable
 
 logger = setup_logger(__name__)
 
-# ============================================
-# Função Auxiliar: Contar Tokens
-# ============================================
 def count_tokens(text: str, model: str = "gpt-4o") -> int:
-    """Conta quantos tokens um texto gastaria no modelo especificado."""
     try:
         encoding = tiktoken.encoding_for_model(model)
         return len(encoding.encode(text))
     except KeyError:
-        # Fallback para encoding padrão se modelo for muito novo/desconhecido
         encoding = tiktoken.get_encoding("cl100k_base")
         return len(encoding.encode(text))
     except Exception as e:
         logger.warning(f"Erro ao contar tokens: {e}")
         return 0
 
-# ============================================
-# Definição das Ferramentas (Tools)
-# ============================================
-
 @tool
 def estoque_tool(url: str) -> str:
-    """Consultar estoque e preço atual."""
     return estoque(url)
 
 @tool
 def pedidos_tool(json_body: str) -> str:
-    """Enviar o pedido finalizado. Abre janela de edição de 10min."""
     resultado = pedidos(json_body)
     if "sucesso" in resultado.lower() or "✅" in resultado:
         try:
@@ -70,36 +58,30 @@ def pedidos_tool(json_body: str) -> str:
 
 @tool
 def alterar_tool(telefone: str, json_body: str) -> str:
-    """Atualizar pedido (apenas se permitido)."""
     return alterar(telefone, json_body)
 
 @tool
 def check_edit_window_tool(telefone: str) -> str:
-    """Verifica se pedido ainda pode ser alterado."""
     if is_order_editable(telefone):
         return "PERMITIDO: Pedido fechado há menos de 10 min."
     return "EXPIRADO: Tempo acabou. Crie NOVO PEDIDO."
 
 @tool
 def search_history_tool(telefone: str, keyword: str = None) -> str:
-    """Busca mensagens anteriores."""
     return search_message_history(telefone, keyword)
 
 @tool
 def time_tool() -> str:
-    """Data e hora atual."""
     return get_current_time()
 
 @tool("ean")
 def ean_tool_alias(query: str) -> str:
-    """Buscar produto na base."""
     q = (query or "").strip()
     if q.startswith("{") and q.endswith("}"): q = ""
     return ean_lookup(q)
 
 @tool("estoque")
 def estoque_preco_alias(ean: str) -> str:
-    """Consulta preço pelo EAN."""
     return estoque_preco(ean)
 
 ACTIVE_TOOLS = [
@@ -112,10 +94,6 @@ ACTIVE_TOOLS = [
     alterar_tool,
     check_edit_window_tool,
 ]
-
-# ============================================
-# Configuração do Grafo e Prompt
-# ============================================
 
 def load_system_prompt() -> str:
     base_dir = Path(__file__).resolve().parent
@@ -147,10 +125,6 @@ def get_agent_graph():
         _agent_graph = create_agent_with_history()
     return _agent_graph
 
-# ============================================
-# Função Principal (Com Logs e Contagem de Tokens)
-# ============================================
-
 def run_agent_langgraph(telefone: str, mensagem: str) -> Dict[str, Any]:
     print(f"[AGENT] Telefone: {telefone} | Msg bruta: {mensagem[:50]}...")
     
@@ -168,17 +142,19 @@ def run_agent_langgraph(telefone: str, mensagem: str) -> Dict[str, Any]:
     except: pass
 
     try:
-        # 1. Carrega o Prompt Base (Minimalista)
+        # 1. Carrega o Prompt Base
         base_system_prompt = load_system_prompt()
+        
+        # --- INJEÇÃO DO TELEFONE NO CONTEXTO ---
+        base_system_prompt += f"\n\n[DADOS DO CLIENTE]\nSeu Telefone (WhatsApp): {telefone}\nUse este número para preencher o JSON automaticamente."
+        # ---------------------------------------
         
         # 2. Busca Regras (RAG)
         logger.info(f"🔍 Buscando regras para: '{clean_message[:30]}...'")
         regras_encontradas = search_rules(clean_message)
         
-        # 3. Calcula Tokens do RAG
         tokens_rag = count_tokens(regras_encontradas) if regras_encontradas else 0
         
-        # LOG DETALHADO DO RAG
         if regras_encontradas:
             logger.info(f"📜 [RAG] Supabase Retornou ({tokens_rag} tokens):\n{regras_encontradas.strip()}")
         else:
@@ -195,15 +171,12 @@ O sistema encontrou estas regras no manual da empresa para o contexto atual:
 APLIQUE ESSAS REGRAS NA SUA RESPOSTA IMEDIATAMENTE.
 """
         
-        # 4. Prepara Mensagens para o Agente
         agent = get_agent_graph()
         messages_payload = []
         
-        # Injeta Regras
         if system_injection:
             messages_payload.append(SystemMessage(content=system_injection))
         
-        # Adiciona User Message
         if image_url:
             messages_payload.append(HumanMessage(content=[
                 {"type": "text", "text": clean_message},
@@ -212,14 +185,11 @@ APLIQUE ESSAS REGRAS NA SUA RESPOSTA IMEDIATAMENTE.
         else:
             messages_payload.append(HumanMessage(content=clean_message))
 
-        # 5. CÁLCULO TOTAL DE TOKENS (Estimativa de Entrada)
-        # Somamos: Prompt Base + Injeção RAG + Mensagem do Usuário
         full_context_str = base_system_prompt + "\n" + system_injection + "\n" + clean_message
         total_input_tokens = count_tokens(full_context_str)
         
         logger.info(f"📊 [MÉTRICAS] Tokens RAG: {tokens_rag} | Tokens TOTAL Entrada: ~{total_input_tokens}")
 
-        # 6. Execução do Agente
         initial_state = {"messages": messages_payload}
         config = {"configurable": {"thread_id": telefone}}
         
@@ -228,8 +198,6 @@ APLIQUE ESSAS REGRAS NA SUA RESPOSTA IMEDIATAMENTE.
         output = "Desculpe, erro técnico."
         if isinstance(result, dict) and "messages" in result:
             output = str(result["messages"][-1].content)
-            
-            # Opcional: Contar tokens da saída também
             tokens_output = count_tokens(output)
             logger.info(f"📊 [MÉTRICAS] Tokens Saída (Resposta): {tokens_output}")
         
