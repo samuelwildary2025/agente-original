@@ -1,7 +1,7 @@
 """
 Servidor FastAPI para receber mensagens do WhatsApp e processar com o agente
 Suporta: Texto, Áudio (Transcrição Whisper Local), Imagem (Visão) e PDF (Extração de Texto + Link)
-Versão: 1.7.0 (Completa com Transcrição Inteligente + Regras de Tempo)
+Versão: 1.8.0 (Completa com Mensagens Sequenciais)
 """
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -32,12 +32,12 @@ from tools.redis_tools import (
     pop_all_messages,
     set_agent_cooldown,
     is_agent_in_cooldown,
-    check_and_refresh_session, # Import da nova regra de 40min
+    check_and_refresh_session,
 )
 
 logger = setup_logger(__name__)
 
-app = FastAPI(title="Agente de Supermercado", version="1.7.0")
+app = FastAPI(title="Agente de Supermercado", version="1.8.0")
 
 # --- Models ---
 class WhatsAppMessage(BaseModel):
@@ -74,7 +74,6 @@ def get_media_url_uaz(message_id: str) -> Optional[str]:
         url = f"{base.split('/message')[0]}/message/download"
 
     headers = {"Content-Type": "application/json", "token": (settings.whatsapp_token or "").strip()}
-    # return_link=True devolve url pública
     payload = {"id": message_id, "return_link": True, "return_base64": False}
     
     try:
@@ -98,11 +97,9 @@ def process_pdf_uaz(message_id: str) -> Optional[str]:
     
     logger.info(f"📄 Processando PDF: {url}")
     try:
-        # Baixar o arquivo
         response = requests.get(url, timeout=20)
         response.raise_for_status()
         
-        # Ler PDF em memória
         f = io.BytesIO(response.content)
         reader = PdfReader(f)
         
@@ -126,7 +123,6 @@ def transcribe_audio_uaz(message_id: str) -> Optional[str]:
     """
     if not message_id: return None
     
-    # 1. Obter a URL do áudio
     url = get_media_url_uaz(message_id)
     if not url: return None
 
@@ -135,7 +131,6 @@ def transcribe_audio_uaz(message_id: str) -> Optional[str]:
     try:
         logger.info(f"🎧 Baixando áudio para transcrição inteligente: {message_id}")
         
-        # 2. Baixar o arquivo de áudio
         headers = {} 
         if settings.whatsapp_token:
              headers["token"] = (settings.whatsapp_token or "").strip()
@@ -143,11 +138,9 @@ def transcribe_audio_uaz(message_id: str) -> Optional[str]:
         response = requests.get(url, headers=headers, timeout=20)
         response.raise_for_status()
         
-        # 3. Salvar temporariamente
         with open(temp_filename, "wb") as f:
             f.write(response.content)
 
-        # 4. Transcrever com a OpenAI (Whisper)
         client = OpenAI(api_key=settings.openai_api_key)
         
         with open(temp_filename, "rb") as audio_file:
@@ -155,11 +148,9 @@ def transcribe_audio_uaz(message_id: str) -> Optional[str]:
                 model="whisper-1", 
                 file=audio_file,
                 language="pt",
-                # Contexto para melhorar reconhecimento de marcas
                 prompt="Lista de compras, supermercado, marcas: Ypê, Coca-Cola, Skol, Brahma, Heineken, Omo, Tixan, Arroz Camil, Feijão Kicaldo, Ninho, Aptamil, Piracanjuba, Mussarela, Calabresa."
             )
         
-        # 5. Limpar e retornar
         texto = transcript.text
         logger.info(f"📝 Transcrição Whisper: {texto}")
         
@@ -176,13 +167,9 @@ def transcribe_audio_uaz(message_id: str) -> Optional[str]:
         return None
 
 def _extract_incoming(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normaliza e processa (Texto, Áudio, Imagem, Documento/PDF).
-    BLINDADA: Ignora LIDs e prioriza números reais.
-    """
+    """Normaliza e processa (Texto, Áudio, Imagem, Documento/PDF)."""
     
     def _clean_number(jid: Any) -> Optional[str]:
-        """Extrai apenas o número de telefone de um JID válido."""
         if not jid or not isinstance(jid, str): return None
         if "@lid" in jid: return None
         if "@g.us" in jid: return None
@@ -201,19 +188,16 @@ def _extract_incoming(payload: Dict[str, Any]) -> Dict[str, Any]:
             chat = {"wa_id": m0.get("sender") or m0.get("chatid")}
         except: pass
 
-    # --- LÓGICA DE TELEFONE BLINDADA ---
     telefone = None
-    candidates = []
-    
-    if isinstance(message_any, dict):
-        candidates.append(message_any.get("sender"))
-        candidates.append(message_any.get("chatid"))
-    
-    candidates.append(chat.get("id"))
-    candidates.append(chat.get("wa_id"))
-    candidates.append(chat.get("phone"))
-    candidates.append(payload.get("from"))
-    candidates.append(payload.get("sender"))
+    candidates = [
+        message_any.get("sender"),
+        message_any.get("chatid"),
+        chat.get("id"),
+        chat.get("wa_id"),
+        chat.get("phone"),
+        payload.get("from"),
+        payload.get("sender")
+    ]
 
     for cand in candidates:
         cleaned = _clean_number(cand)
@@ -227,7 +211,6 @@ def _extract_incoming(payload: Dict[str, Any]) -> Dict[str, Any]:
             telefone = re.sub(r"\D", "", raw)
             logger.warning(f"⚠️ Usando fallback de telefone: {telefone}")
 
-    # --- Extração de Conteúdo ---
     mensagem_texto = payload.get("text")
     message_id = payload.get("id") or payload.get("messageid")
     from_me = False
@@ -266,7 +249,6 @@ def _extract_incoming(payload: Dict[str, Any]) -> Dict[str, Any]:
         candidates_me = [chat.get("wa_id"), chat.get("phone"), payload.get("sender")]
         telefone = next((re.sub(r"\D", "", c) for c in candidates_me if c and "@lid" not in str(c)), telefone)
 
-    # --- Lógica de Mídia ---
     if message_type == "audio" and not mensagem_texto:
         if message_id:
             trans = transcribe_audio_uaz(message_id)
@@ -308,6 +290,10 @@ def _extract_incoming(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 def send_whatsapp_message(telefone: str, mensagem: str) -> bool:
+    """
+    Envia mensagem via WhatsApp API.
+    Suporta o separador '|||' para enviar múltiplas mensagens sequenciais.
+    """
     base = get_api_base_url()
     if not base: return False
     try:
@@ -319,21 +305,19 @@ def send_whatsapp_message(telefone: str, mensagem: str) -> bool:
     
     headers = {"Content-Type": "application/json", "token": (settings.whatsapp_token or "").strip()}
     
-    max_len = 4000
-    msgs = []
-    if len(mensagem) > max_len:
-        curr = ""
-        for p in mensagem.split('\n\n'):
-            if len(curr) + len(p) + 2 <= max_len: curr += p + "\n\n"
-            else:
-                if curr: msgs.append(curr.strip())
-                curr = p + "\n\n"
-        if curr: msgs.append(curr.strip())
+    # --- Lógica de Quebra de Mensagens (Balões Separados) ---
+    if "|||" in mensagem:
+        msgs = [m.strip() for m in mensagem.split("|||") if m.strip()]
     else:
         msgs = [mensagem]
     
     try:
-        for msg in msgs:
+        for i, msg in enumerate(msgs):
+            # Pequena pausa entre mensagens para parecer natural (exceto na primeira)
+            if i > 0:
+                # Pausa aleatória entre 1.0 e 2.5 segundos
+                time.sleep(random.uniform(1.0, 2.5))
+                
             payload = {"number": re.sub(r"\D", "", telefone or ""), "text": msg, "openTicket": "1"}
             requests.post(url, headers=headers, json=payload, timeout=10)
         return True
@@ -361,54 +345,41 @@ def send_presence(num, type_):
     except: pass
 
 def process_async(tel, msg, mid=None):
-    """
-    Processa mensagem do Buffer.
-    Implementa a regra de SESSÃO DE 40 MINUTOS.
-    """
     try:
         num = re.sub(r"\D", "", tel)
         
-        # --- NOVA LÓGICA DE SESSÃO (40 MINUTOS) ---
-        # Verifica se a sessão expirou ANTES de processar
+        # Regra de Sessão (40 min)
         sessao_ativa = check_and_refresh_session(num, ttl_minutes=40)
-        
         mensagem_final = msg
-        
         if not sessao_ativa:
             logger.info(f"🕒 Sessão expirada para {num}. Forçando novo pedido.")
-            # Injetamos um comando de sistema invisível para o cliente, mas visível para a IA
             mensagem_final = f"[SISTEMA: A sessão anterior expirou (passou de 40min). IGNORE o pedido antigo e comece um NOVO PEDIDO do zero agora.] {msg}"
-        # ------------------------------------------
 
-        # 1. Simular "Lendo" (Delay Humano)
+        # 1. Delay Humano Inicial
         tempo_leitura = random.uniform(2.0, 4.0) 
         time.sleep(tempo_leitura)
 
-        # 2. Começar a "Digitar"
+        # 2. Status "Digitando"
         send_presence(num, "composing")
         
         # 3. Processamento IA
         res = run_agent(tel, mensagem_final)
         txt = res.get("output", "Erro ao processar.")
         
-        # 4. Parar "Digitar"
+        # 4. Parar "Digitando" e Enviar
         send_presence(num, "paused")
-        time.sleep(0.5) # Pausa dramática antes de chegar
-
-        # 5. Enviar Mensagem
+        # Pequena pausa antes de enviar a primeira mensagem
+        time.sleep(0.5)
+        
         send_whatsapp_message(tel, txt)
 
     except Exception as e:
         logger.error(f"Erro async: {e}")
     finally:
-        # Garante limpeza
         send_presence(tel, "paused")
         presence_sessions.pop(re.sub(r"\D", "", tel), None)
 
 def buffer_loop(tel):
-    """
-    Loop do Buffer (3 ciclos de 3.5s)
-    """
     try:
         n = re.sub(r"\D","",tel)
         prev = get_buffer_length(n)
@@ -428,7 +399,7 @@ def buffer_loop(tel):
 
 # --- Endpoints ---
 @app.get("/")
-async def root(): return {"status":"online", "ver":"1.7.0"}
+async def root(): return {"status":"online", "ver":"1.8.0"}
 
 @app.get("/health")
 async def health(): return {"status":"healthy", "ts":datetime.now().isoformat()}
