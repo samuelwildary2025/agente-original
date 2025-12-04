@@ -21,6 +21,16 @@ def get_auth_headers() -> Dict[str, str]:
 
 def estoque(url: str) -> str:
     """Consulta o estoque e preço de produtos no sistema do supermercado."""
+    
+    # --- CORREÇÃO: Tratamento de URL relativa ---
+    # Se o agente enviar apenas "/produtos/..." ou "api/...", adicionamos a base.
+    if not url.startswith("http"):
+        # Garante que usamos a URL base configurada se o LLM esquecer o domínio
+        base = (settings.supermercado_base_url or "").rstrip("/")
+        path = url.lstrip("/")
+        url = f"{base}/{path}"
+    # --------------------------------------------
+
     logger.info(f"Consultando estoque: {url}")
     try:
         response = requests.get(url, headers=get_auth_headers(), timeout=10)
@@ -81,10 +91,7 @@ def ean_lookup(query: str) -> str:
     
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
-        # ... (Mantendo a lógica original de limpeza de JSON para produtos) ...
-        # Para economizar espaço aqui, estou simplificando, mas você pode manter
-        # a lógica completa de regex do seu arquivo original se quiser.
-        # O foco aqui é a nova função search_rules abaixo.
+        # Retorna o texto bruto para ser processado pelo agente
         return resp.text 
     except Exception as e:
         return f"Erro na busca EAN: {e}"
@@ -106,7 +113,6 @@ def estoque_preco(ean: str) -> str:
         return f"Erro ao consultar preço (ERP): {e}"
 
 
-# --- NOVA FUNÇÃO DE REGRAS ---
 def search_rules(query: str) -> str:
     """
     Busca regras no Supabase (type='rules') para injetar no contexto.
